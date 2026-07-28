@@ -231,7 +231,31 @@ next_vmid() {
   echo $(( id + 1 ))
 }
 
-# Apply: affinity + hostpci + sockets/cores matching affinity
+# Compute an updated net0 line, preserving all existing net0 parameters
+# (model, mac, vlan tag, rate limit, multiqueue, firewall, ...) except the bridge.
+set_net0_bridge() {
+  local conf="$1"
+  local bridge="$2"
+
+  local line
+  line="$(grep -m1 '^net0:' "$conf" 2>/dev/null || true)"
+
+  local value
+  if [[ -z "$line" ]]; then
+    echo "net0: virtio,bridge=${bridge}"
+    return
+  fi
+
+  value="${line#net0: }"
+  if [[ "$value" == *"bridge="* ]]; then
+    value="$(printf '%s' "$value" | sed -E "s/bridge=[^,]*/bridge=${bridge}/")"
+  else
+    value="${value},bridge=${bridge}"
+  fi
+  echo "net0: ${value}"
+}
+
+# Apply: affinity + hostpci + sockets/cores matching affinity + network bridge
 apply_vm_config() {
   local vmid="$1"
   local affinity_ranges="$2"
@@ -242,6 +266,10 @@ apply_vm_config() {
   local conf="/etc/pve/qemu-server/${vmid}.conf"
   [[ -f "$conf" ]] || { echo "ERROR: Missing config $conf" >&2; return 1; }
 
+  # Compute updated net0 (dog VMs, i.e. VMs with GPU, use vmbr1) before the file is rewritten
+  local new_net0
+  new_net0="$(set_net0_bridge "$conf" "vmbr1")"
+
   local tmp="/etc/pve/qemu-server/.${vmid}.conf.tmp.$$"
 
   # Filter out old lines we control
@@ -250,7 +278,8 @@ apply_vm_config() {
     !/^affinity:/ &&
     !/^cores:/ &&
     !/^sockets:/ &&
-    !/^onboot:/ { print }
+    !/^onboot:/ &&
+    !/^net0:/ { print }
   ' "$conf" > "$tmp"
 
   # Ensure numa: 1 exists
@@ -271,6 +300,9 @@ apply_vm_config() {
   if [[ -n "$gpu_audio" ]]; then
     echo "hostpci1: ${gpu_audio},pcie=1" >> "$tmp"
   fi
+
+  # Dog VMs (with GPU) get vmbr1
+  echo "$new_net0" >> "$tmp"
 
   if (( DRY_RUN )); then
     echo "+ (would write) $conf"
@@ -525,7 +557,7 @@ run "${cmd[@]}"
 
 run qm unlock "$kennel_id" || true
 
-# Apply minimal config for kennel (no GPU passthrough, no NUMA affinity)
+# Apply minimal config for kennel (no GPU passthrough, no NUMA affinity, vmbr0 network)
 apply_kennel_config() {
   local vmid="$1"
   local cores="$2"
@@ -533,6 +565,10 @@ apply_kennel_config() {
 
   local conf="/etc/pve/qemu-server/${vmid}.conf"
   [[ -f "$conf" ]] || { echo "ERROR: Missing config $conf" >&2; return 1; }
+
+  # Compute updated net0 (kennel VM, i.e. no GPU, uses vmbr0) before the file is rewritten
+  local new_net0
+  new_net0="$(set_net0_bridge "$conf" "vmbr0")"
 
   local tmp="/etc/pve/qemu-server/.${vmid}.conf.tmp.$$"
 
@@ -544,13 +580,17 @@ apply_kennel_config() {
     !/^sockets:/ &&
     !/^numa:/ &&
     !/^memory:/ &&
-    !/^onboot:/ { print }
+    !/^onboot:/ &&
+    !/^net0:/ { print }
   ' "$conf" > "$tmp"
 
   echo "onboot: 1" >> "$tmp"
   echo "sockets: 1" >> "$tmp"
   echo "cores: ${cores}" >> "$tmp"
   echo "memory: ${memory}" >> "$tmp"
+
+  # Kennel VM (no GPU) gets vmbr0
+  echo "$new_net0" >> "$tmp"
 
   if (( DRY_RUN )); then
     echo "+ (would write) $conf"
