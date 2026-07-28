@@ -242,6 +242,8 @@ set_net0_bridge() {
 
   local value
   if [[ -z "$line" ]]; then
+    # Safeguard only: cloned VMs inherit net0 from the template, so this
+    # should not normally happen. Default to virtio (matches template model).
     echo "net0: virtio,bridge=${bridge}"
     return
   fi
