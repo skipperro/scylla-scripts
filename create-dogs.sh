@@ -34,12 +34,13 @@ Core/GPU assignment options:
 
 Proxmox clone/apply options (only used if --template-vmid is given):
   --template-vmid VMID   REQUIRED to create linked clones + write /etc/pve/qemu-server configs.
-                         If omitted and exactly one template exists on the node, it is used automatically.
+                         If omitted, defaults to the highest template VMID available on the node.
   --name-prefix STR      VM name prefix (default: dog)
   --node-name NAME       Override the Proxmox node name used in VM hostnames (default: hostname -s)
   --target-node NODE     qm clone --target NODE (optional)
   --storage STORAGE      qm clone --storage STORAGE (optional)
-  --start-vmid VMID      Start VMIDs from this number (optional; will increment, skipping existing)
+  --start-vmid VMID      Start VMIDs from this number (default: 1XXX00 where XXX is node number,
+                         e.g. scylla3 -> 100300, scylla15 -> 101500; will increment, skipping existing)
   --count N              Only create/assign first N GPUs/VMs (optional)
   --dry-run              Print what would be executed, but do not change anything.
 
@@ -90,6 +91,16 @@ else
   PVE_NODE_NAME="$(hostname -s 2>/dev/null || hostname)"
 fi
 
+# Auto-detect START_VMID from node name if not provided: 1XXX00 where XXX is 3-digit node number
+# e.g. scylla3 -> 100300, scylla15 -> 101500
+if [[ -z "$START_VMID" ]]; then
+  _node_num="$(echo "$PVE_NODE_NAME" | sed -E 's/^[^0-9]*([0-9]+)$/\1/')"
+  if [[ "$_node_num" =~ ^[0-9]+$ ]]; then
+    START_VMID="$(printf "1%03d00" "$_node_num")"
+    echo "Auto-detected start VMID from node name '${PVE_NODE_NAME}': $START_VMID"
+  fi
+fi
+
 command -v lspci >/dev/null || { echo "Missing lspci (pciutils)" >&2; exit 1; }
 
 # If cloning/applying:
@@ -98,17 +109,15 @@ if [[ -n "$TEMPLATE_VMID" ]]; then
   [[ -d /etc/pve/qemu-server ]] || { echo "Missing /etc/pve/qemu-server - are you on Proxmox?" >&2; exit 1; }
 fi
 
-# Auto-detect template VMID when not provided: if exactly one template exists, use it
+# Auto-detect template VMID when not provided: use the highest template VMID available
 if [[ -z "$TEMPLATE_VMID" ]] && command -v qm >/dev/null 2>&1 && [[ -d /etc/pve/qemu-server ]]; then
   mapfile -t _tmpl_ids < <(
     grep -rl 'template: 1' /etc/pve/qemu-server/ 2>/dev/null \
       | sed -E 's#.*/([0-9]+)\.conf#\1#' | sort -n
   )
-  if [[ "${#_tmpl_ids[@]}" -eq 1 ]]; then
-    TEMPLATE_VMID="${_tmpl_ids[0]}"
-    echo "Auto-detected template VMID: $TEMPLATE_VMID"
-  elif [[ "${#_tmpl_ids[@]}" -gt 1 ]]; then
-    echo "Multiple templates found (${_tmpl_ids[*]}); please specify --template-vmid." >&2
+  if [[ "${#_tmpl_ids[@]}" -ge 1 ]]; then
+    TEMPLATE_VMID="${_tmpl_ids[-1]}"
+    echo "Auto-detected template VMID (highest available): $TEMPLATE_VMID"
   fi
 fi
 
