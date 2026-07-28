@@ -359,7 +359,12 @@ apply_changes_to_vm() {
   local desired_hostname="${NODE_NAME}-${vmid}"
   local vmname_to_write="${vmname:-$desired_hostname}"
 
-  echo "VMID $vmid (${vmname:-<no name>}): applying changes..."
+  # Detect kennel VM by name pattern
+  if [[ "$vmname" == *".kennel."* ]]; then
+    echo "VMID $vmid (${vmname}): applying changes [kennel VM]..."
+  else
+    echo "VMID $vmid (${vmname:-<no name>}): applying changes..."
+  fi
   echo "  Hostname -> $desired_hostname"
   echo "  vm-name.txt -> $vmname_to_write"
 
