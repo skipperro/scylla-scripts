@@ -501,8 +501,8 @@ echo
 # ----------------------------
 # 6a) Create kennel VM (shared drive manager, no GPU, minimal resources)
 # ----------------------------
-KENNEL_CORES=2
-KENNEL_MEMORY=4096
+KENNEL_CORES=8
+KENNEL_MEMORY=8192
 
 kennel_id="$(next_vmid)"
 kennel_name="${PVE_NODE_NAME}.kennel.${ENVIRONMENT}.arcware.com"
