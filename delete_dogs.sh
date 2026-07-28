@@ -2,6 +2,9 @@
 # delete_dogs.sh
 # Deletes Proxmox QEMU VMs whose VM name contains a pattern (default: "dog")
 # Dry-run by default. Use --apply to actually delete.
+#
+# Parallelized: sends shutdown to all VMs simultaneously, waits once for the
+# timeout, then destroys all in parallel. Much faster than sequential deletion.
 
 set -euo pipefail
 
@@ -9,15 +12,17 @@ PATTERN=".dog"
 KENNEL_PATTERN=".kennel"
 APPLY=0
 TIMEOUT=30
+MAX_PARALLEL=4
 
 usage() {
   cat <<EOF
 Usage:
-  ./delete_dogs.sh [--pattern STR] [--apply] [--timeout SEC]
+  ./delete_dogs.sh [--pattern STR] [--apply] [--timeout SEC] [--parallel N]
 
 Defaults:
-  --pattern  dog
-  --timeout  30
+  --pattern   dog
+  --timeout   30
+  --parallel  4
   (dry-run unless --apply is set)
 
 Examples:
@@ -29,6 +34,9 @@ Examples:
 
   # Delete using a custom pattern:
   ./delete_dogs.sh --pattern myprefix --apply
+
+  # Delete with higher parallelism:
+  ./delete_dogs.sh --apply --parallel 8
 EOF
 }
 
@@ -37,6 +45,7 @@ while [[ $# -gt 0 ]]; do
     --pattern|-p) PATTERN="${2:-}"; shift 2 ;;
     --apply) APPLY=1; shift ;;
     --timeout) TIMEOUT="${2:-30}"; shift 2 ;;
+    --parallel) MAX_PARALLEL="${2:-4}"; shift 2 ;;
     --help|-h) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -88,54 +97,109 @@ echo
 if (( APPLY == 0 )); then
   echo "Dry-run only. Re-run with --apply to actually delete."
   echo
-  echo "Would run (per VM, dogs first then kennel last):"
-  echo "  qm shutdown <VMID> --timeout $TIMEOUT  (fallback to qm stop)"
-  echo "  qm destroy <VMID> --purge 1 --destroy-unreferenced-disks 1 (fallback to qm destroy --purge 1)"
+  echo "Would run (dogs first then kennel last, parallelized up to $MAX_PARALLEL at a time):"
+  echo "  1. qm shutdown <all VMIDs> in parallel"
+  echo "  2. Wait ${TIMEOUT}s for graceful shutdown"
+  echo "  3. qm stop <still-running VMIDs> in parallel"
+  echo "  4. qm destroy <all VMIDs> --purge 1 --destroy-unreferenced-disks 1 in parallel"
   exit 0
 fi
 
+# --- Helper: delete a batch of VMs in parallel ---
+# Sends shutdown to all, waits once, force-stops stragglers, then destroys all in parallel.
+delete_batch() {
+  local label="$1"
+  shift
+  local batch=("$@")
+
+  if [[ "${#batch[@]}" -eq 0 ]]; then
+    return
+  fi
+
+  echo "=== Deleting ${#batch[@]} ${label} VM(s) in parallel (max $MAX_PARALLEL concurrent) ==="
+  echo
+
+  # Step 1: Send shutdown to all VMs in parallel
+  echo "--- Sending shutdown to all ${label} VMs ---"
+  local shutdown_pids=()
+  local job_count=0
+  for m in "${batch[@]}"; do
+    IFS='|' read -r id name <<< "$m"
+    while (( job_count >= MAX_PARALLEL )); do
+      wait -n 2>/dev/null || true
+      job_count=$((job_count - 1))
+    done
+    (
+      qm shutdown "$id" --timeout "$TIMEOUT" >/dev/null 2>&1 || true
+    ) &
+    shutdown_pids+=("$!")
+    job_count=$((job_count + 1))
+    echo "  VMID $id ($name): shutdown signal sent"
+  done
+
+  # Wait for all shutdown commands to finish (they have their own internal timeout)
+  for pid in "${shutdown_pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+  echo "  All shutdown commands completed."
+  echo
+
+  # Step 2: Force-stop any VMs that are still running
+  echo "--- Force-stopping any remaining VMs ---"
+  local stop_pids=()
+  job_count=0
+  for m in "${batch[@]}"; do
+    IFS='|' read -r id name <<< "$m"
+    while (( job_count >= MAX_PARALLEL )); do
+      wait -n 2>/dev/null || true
+      job_count=$((job_count - 1))
+    done
+    (
+      qm stop "$id" >/dev/null 2>&1 || true
+    ) &
+    stop_pids+=("$!")
+    job_count=$((job_count + 1))
+  done
+  for pid in "${stop_pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+  echo "  All VMs stopped."
+  echo
+
+  # Step 3: Destroy all VMs in parallel
+  echo "--- Destroying all ${label} VMs ---"
+  local destroy_pids=()
+  job_count=0
+  for m in "${batch[@]}"; do
+    IFS='|' read -r id name <<< "$m"
+    while (( job_count >= MAX_PARALLEL )); do
+      wait -n 2>/dev/null || true
+      job_count=$((job_count - 1))
+    done
+    (
+      if qm destroy "$id" --purge 1 --destroy-unreferenced-disks 1 >/dev/null 2>&1; then
+        echo "  VMID $id ($name): destroyed (purge + destroy-unreferenced-disks)"
+      else
+        qm destroy "$id" --purge 1 >/dev/null 2>&1
+        echo "  VMID $id ($name): destroyed (purge)"
+      fi
+    ) &
+    destroy_pids+=("$!")
+    job_count=$((job_count + 1))
+  done
+  for pid in "${destroy_pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+  echo "  All ${label} VMs destroyed."
+  echo
+}
+
 echo "APPLY mode: deleting VMs now (dogs first, then kennel)..."
+echo "Parallelism: up to $MAX_PARALLEL concurrent operations"
 echo
 
-# Delete dogs first
-for m in "${dog_matches[@]}"; do
-  IFS='|' read -r id name <<< "$m"
-  echo "==> Deleting VMID $id ($name)"
+# Delete dogs first, then kennels
+delete_batch "dog" "${dog_matches[@]}"
+delete_batch "kennel" "${kennel_matches[@]}"
 
-  # Try graceful shutdown first
-  qm shutdown "$id" --timeout "$TIMEOUT" >/dev/null 2>&1 || true
-
-  # Ensure it's stopped
-  qm stop "$id" >/dev/null 2>&1 || true
-
-  # Destroy (try newer/safer flags first, fallback if not supported)
-  if qm destroy "$id" --purge 1 --destroy-unreferenced-disks 1 >/dev/null 2>&1; then
-    echo "    destroyed (purge + destroy-unreferenced-disks)"
-  else
-    qm destroy "$id" --purge 1 >/dev/null
-    echo "    destroyed (purge)"
-  fi
-done
-
-# Delete kennel last
-for m in "${kennel_matches[@]}"; do
-  IFS='|' read -r id name <<< "$m"
-  echo "==> Deleting VMID $id ($name) [kennel - deleted last]"
-
-  # Try graceful shutdown first
-  qm shutdown "$id" --timeout "$TIMEOUT" >/dev/null 2>&1 || true
-
-  # Ensure it's stopped
-  qm stop "$id" >/dev/null 2>&1 || true
-
-  # Destroy (try newer/safer flags first, fallback if not supported)
-  if qm destroy "$id" --purge 1 --destroy-unreferenced-disks 1 >/dev/null 2>&1; then
-    echo "    destroyed (purge + destroy-unreferenced-disks)"
-  else
-    qm destroy "$id" --purge 1 >/dev/null
-    echo "    destroyed (purge)"
-  fi
-done
-
-echo
 echo "Done."
