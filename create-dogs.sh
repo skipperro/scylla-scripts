@@ -498,6 +498,67 @@ echo "Node name: $PVE_NODE_NAME"
 echo "Environment: $ENVIRONMENT"
 echo
 
+# ----------------------------
+# 6a) Create kennel VM (shared drive manager, no GPU, minimal resources)
+# ----------------------------
+KENNEL_CORES=2
+KENNEL_MEMORY=4096
+
+kennel_id="$(next_vmid)"
+kennel_name="${PVE_NODE_NAME}.kennel.${ENVIRONMENT}.arcware.com"
+
+cmd=(qm clone "$TEMPLATE_VMID" "$kennel_id" --name "$kennel_name" --full 0)
+[[ -n "$TARGET_NODE" ]] && cmd+=(--target "$TARGET_NODE")
+[[ -n "$STORAGE_ID" ]] && cmd+=(--storage "$STORAGE_ID")
+
+echo "Creating kennel VM $kennel_id with name=$kennel_name (no GPU, ${KENNEL_CORES} cores, ${KENNEL_MEMORY}MB RAM)"
+run "${cmd[@]}"
+
+run qm unlock "$kennel_id" || true
+
+# Apply minimal config for kennel (no GPU passthrough, no NUMA affinity)
+apply_kennel_config() {
+  local vmid="$1"
+  local cores="$2"
+  local memory="$3"
+
+  local conf="/etc/pve/qemu-server/${vmid}.conf"
+  [[ -f "$conf" ]] || { echo "ERROR: Missing config $conf" >&2; return 1; }
+
+  local tmp="/etc/pve/qemu-server/.${vmid}.conf.tmp.$$"
+
+  # Filter out old lines we control
+  awk '
+    !/^hostpci[0-9]+:/ &&
+    !/^affinity:/ &&
+    !/^cores:/ &&
+    !/^sockets:/ &&
+    !/^numa:/ &&
+    !/^memory:/ &&
+    !/^onboot:/ { print }
+  ' "$conf" > "$tmp"
+
+  echo "onboot: 1" >> "$tmp"
+  echo "sockets: 1" >> "$tmp"
+  echo "cores: ${cores}" >> "$tmp"
+  echo "memory: ${memory}" >> "$tmp"
+
+  if (( DRY_RUN )); then
+    echo "+ (would write) $conf"
+    rm -f "$tmp"
+  else
+    mv -f "$tmp" "$conf"
+  fi
+}
+
+apply_kennel_config "$kennel_id" "$KENNEL_CORES" "$KENNEL_MEMORY"
+
+echo "  -> VMID $kennel_id done (kennel: minimal config, no GPU)"
+echo
+
+# ----------------------------
+# 6b) Create dog VMs with GPU passthrough
+# ----------------------------
 for i in "${!GPU_BDFS[@]}"; do
   aff="${GPU_ASSIGNED_AFFINITY[$i]}"
   vcpus="${GPU_ASSIGNED_VCPUS[$i]}"
