@@ -29,6 +29,7 @@ REBOOT_DOWN_WAIT_SEC=120    # wait for GA to go down after reboot triggers
 REBOOT_WAIT_SEC=900         # wait for GA to come back after reboot
 
 DRY_RUN=0
+REBOOT_HOST=0               # when 1, reboot the host instead of restarting VMs at the end
 MAX_PARALLEL_JOBS=3         # max parallel jobs for apply changes
 START_DELAY_SEC=3           # delay between VM starts to prevent resource spikes
 SHUTDOWN_DELAY_SEC=3        # delay between VM shutdowns to prevent resource spikes
@@ -54,6 +55,8 @@ Options:
   --reboot-down-wait SEC   Wait for GA to go down after reboot (default: $REBOOT_DOWN_WAIT_SEC)
   --reboot-wait SEC        Wait for GA to return after reboot (default: $REBOOT_WAIT_SEC)
 
+  --reboot                 Reboot the host at the end instead of restarting the VMs
+                           (default: bulk-start all VMs again, no host reboot)
   --dry-run                Print actions, do not execute
   -h|--help                Help
 
@@ -61,6 +64,7 @@ Examples:
   sudo ./initialize_dogs_sh
   sudo ./initialize_dogs_sh --dry-run
   sudo ./initialize_dogs_sh --all --settle 30 --cmd-timeout 900
+  sudo ./initialize_dogs_sh --reboot
 EOF
 }
 
@@ -81,6 +85,7 @@ while [[ $# -gt 0 ]]; do
     --reboot-down-wait)  REBOOT_DOWN_WAIT_SEC="${2:-}"; shift 2 ;;
     --reboot-wait)       REBOOT_WAIT_SEC="${2:-}"; shift 2 ;;
 
+    --reboot)            REBOOT_HOST=1; shift ;;
     --dry-run)           DRY_RUN=1; shift ;;
     -h|--help)           usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage >&2; exit 2 ;;
@@ -245,6 +250,11 @@ fi
 echo "GA timeout: $GA_TIMEOUT_SEC s | Settle: $SETTLE_SEC s | Cmd timeout: $CMD_TIMEOUT_SEC s | Cmd retries: $CMD_RETRIES"
 echo "Reboot wait: $REBOOT_WAIT_SEC s"
 echo "Dry run: $DRY_RUN"
+if (( REBOOT_HOST == 1 )); then
+  echo "End action: reboot host"
+else
+  echo "End action: bulk-start VMs (use --reboot to reboot the host instead)"
+fi
 echo
 
 mapfile -t ALL_VMIDS < <(qm list | awk 'NR>1 {print $1}' | sort -n)
@@ -502,21 +512,41 @@ echo
 echo "All shutdown commands sent. VMs are shutting down in the background."
 echo "All done."
 
-# Ask if user wants to reboot the host
 echo
-if (( DRY_RUN )); then
-  echo "DRY RUN: would ask about host reboot"
+if (( REBOOT_HOST == 1 )); then
+  echo "=== --reboot given: rebooting host instead of restarting VMs ==="
+  if (( DRY_RUN )); then
+    echo "DRY RUN: would reboot host now"
+  else
+    echo "Rebooting host in 5 seconds... (Press Ctrl+C to cancel)"
+    sleep 5
+    echo "Rebooting now..."
+    reboot
+  fi
 else
-  read -r -p "Do you want to reboot the host now? [y/N]: " response
-  case "$response" in
-    [yY][eE][sS]|[yY])
-      echo "Rebooting host in 5 seconds... (Press Ctrl+C to cancel)"
-      sleep 5
-      echo "Rebooting now..."
-      reboot
-      ;;
-    *)
-      echo "Host reboot cancelled. Exiting."
-      ;;
-  esac
+  echo "=== Bulk-starting all VMs again (pass --reboot to reboot the host instead) ==="
+  START_AGAIN_PIDS=()
+  VM_START_AGAIN_COUNT=0
+  for vmid in "${APPLIED_VMIDS[@]}"; do
+    echo "VMID $vmid: starting (background)..."
+    if (( DRY_RUN )); then
+      echo "+ qm start $vmid"
+    else
+      qm start "$vmid" &
+      START_AGAIN_PIDS+=("$!")
+    fi
+    VM_START_AGAIN_COUNT=$((VM_START_AGAIN_COUNT + 1))
+    if (( VM_START_AGAIN_COUNT < ${#APPLIED_VMIDS[@]} )) && (( START_DELAY_SEC > 0 )); then
+      sleep "$START_DELAY_SEC"
+    fi
+  done
+
+  if [[ "${#START_AGAIN_PIDS[@]}" -gt 0 ]]; then
+    echo "Waiting for ${#START_AGAIN_PIDS[@]} VM start command(s) to complete..."
+    for pid in "${START_AGAIN_PIDS[@]}"; do
+      wait "$pid" 2>/dev/null || true
+    done
+  fi
+
+  echo "All VMs started."
 fi
