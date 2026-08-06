@@ -4,9 +4,10 @@
 #   1. Edit /etc/default/grub to add "amd_iommu=on iommu=pt" to GRUB_CMDLINE_LINUX_DEFAULT
 #   2. Run update-grub to apply the change
 #   3. Load VFIO kernel modules (vfio, vfio_iommu_type1, vfio_pci, vfio_virqfd) via /etc/modules
-#   4. Install & configure Samba to share a "repository" folder over the network
-#   5. Tune the backing ZFS dataset for throughput (recordsize, compression, atime, xattr, dnodesize)
-#   6. Optionally reboot to apply everything
+#   4. Create a Linux bridge ("repo", 10.200.0.1/24) on the host for the repository network
+#   5. Install & configure Samba to share a "repository" folder over the network
+#   6. Tune the backing ZFS dataset for throughput (recordsize, compression, atime, xattr, dnodesize)
+#   7. Optionally reboot to apply everything
 #
 # Idempotent: safe to run multiple times, existing settings are preserved/updated in place.
 # A backup of each modified file is created before any change (*.bak.<timestamp>).
@@ -29,10 +30,15 @@ SMB_USER="smbguest"
 SMB_GROUP="nogroup"
 ZFS_DATASET="shared-repository"
 
+INTERFACES_FILE="/etc/network/interfaces"
+BRIDGE_NAME="repo"
+BRIDGE_CIDR="10.200.0.1/24"
+
 DRY_RUN=0
 DO_REBOOT=0
 SKIP_SAMBA=0
 SKIP_ZFS=0
+SKIP_BRIDGE=0
 
 usage() {
   cat <<EOF
@@ -45,6 +51,9 @@ following the documented setup steps:
   - GRUB_CMDLINE_LINUX_DEFAULT gets "${IOMMU_PARAMS}" appended (in ${GRUB_FILE})
   - update-grub is run to apply the change
   - vfio, vfio_iommu_type1, vfio_pci, vfio_virqfd are added to ${MODULES_FILE}
+  - A Linux bridge named "${BRIDGE_NAME}" is created with static address
+    ${BRIDGE_CIDR}, no bridge ports, autostart enabled and VLAN-awareness
+    disabled (in ${INTERFACES_FILE})
   - Samba is installed and a guest-accessible "${SHARE_NAME}" share is configured
     for ${SHARE_PATH} (in ${SMB_CONF}), served by the "${SMB_USER}" user
   - The "${ZFS_DATASET}" ZFS dataset is tuned for throughput (recordsize,
@@ -55,8 +64,11 @@ Options:
   --dry-run           Print what would change, without modifying anything.
   --skip-samba        Do not install/configure Samba.
   --skip-zfs          Do not apply the ZFS tuning properties.
+  --skip-bridge       Do not create/configure the "${BRIDGE_NAME}" Linux bridge.
   --share-path PATH   Path to share via Samba (default: ${SHARE_PATH}).
   --zfs-dataset NAME  ZFS dataset to tune (default: ${ZFS_DATASET}).
+  --bridge-name NAME  Name of the Linux bridge to create (default: ${BRIDGE_NAME}).
+  --bridge-cidr CIDR  Static IPv4/CIDR for the bridge (default: ${BRIDGE_CIDR}).
   --help, -h          Show this help.
 EOF
 }
@@ -67,8 +79,11 @@ while [[ $# -gt 0 ]]; do
     --dry-run)      DRY_RUN=1; shift ;;
     --skip-samba)   SKIP_SAMBA=1; shift ;;
     --skip-zfs)     SKIP_ZFS=1; shift ;;
+    --skip-bridge)  SKIP_BRIDGE=1; shift ;;
     --share-path)   SHARE_PATH="$2"; shift 2 ;;
     --zfs-dataset)  ZFS_DATASET="$2"; shift 2 ;;
+    --bridge-name)  BRIDGE_NAME="$2"; shift 2 ;;
+    --bridge-cidr)  BRIDGE_CIDR="$2"; shift 2 ;;
     --help|-h)      usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -102,7 +117,7 @@ backup_file() {
 # ----------------------------
 [[ -f "$GRUB_FILE" ]] || { echo "ERROR: ${GRUB_FILE} not found. Is this a Debian/Proxmox host?" >&2; exit 1; }
 
-echo "== Step 1/4: Configuring GRUB (${GRUB_FILE}) =="
+echo "== Step 1/6: Configuring GRUB (${GRUB_FILE}) =="
 
 current_line="$(grep -m1 '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_FILE" || true)"
 current_value=""
@@ -151,7 +166,7 @@ run update-grub
 # 2) Load VFIO kernel modules via /etc/modules
 # ----------------------------
 echo
-echo "== Step 2/4: Configuring VFIO kernel modules (${MODULES_FILE}) =="
+echo "== Step 2/6: Configuring VFIO kernel modules (${MODULES_FILE}) =="
 
 [[ -f "$MODULES_FILE" ]] || run touch "$MODULES_FILE"
 
@@ -186,14 +201,84 @@ echo
 echo "GRUB and VFIO module configuration complete."
 
 # ----------------------------
-# 3) Install & configure Samba share for the repository folder
+# 3) Create a Linux bridge for the repository network
+# ----------------------------
+if (( SKIP_BRIDGE )); then
+  echo
+  echo "== Step 3/6: Linux bridge configuration skipped (--skip-bridge) =="
+else
+  echo
+  echo "== Step 3/6: Configuring Linux bridge '${BRIDGE_NAME}' (${BRIDGE_CIDR}) =="
+
+  [[ -f "$INTERFACES_FILE" ]] || { echo "ERROR: ${INTERFACES_FILE} not found. Is this a Debian/Proxmox host?" >&2; exit 1; }
+
+  BRIDGE_BEGIN="# BEGIN ${BRIDGE_NAME} bridge (managed by setup_host.sh)"
+  BRIDGE_END="# END ${BRIDGE_NAME} bridge (managed by setup_host.sh)"
+  bridge_block="$(cat <<EOF
+${BRIDGE_BEGIN}
+auto ${BRIDGE_NAME}
+iface ${BRIDGE_NAME} inet static
+    address ${BRIDGE_CIDR}
+    bridge-ports none
+    bridge-stp off
+    bridge-fd 0
+    bridge-vlan-aware no
+${BRIDGE_END}
+EOF
+)"
+
+  bridge_changed=0
+  if grep -qF "$BRIDGE_BEGIN" "$INTERFACES_FILE" 2>/dev/null; then
+    existing_block="$(sed -n "/^${BRIDGE_BEGIN//\//\\/}\$/,/^${BRIDGE_END//\//\\/}\$/p" "$INTERFACES_FILE")"
+    if [[ "$existing_block" == "$bridge_block" ]]; then
+      echo "Linux bridge '${BRIDGE_NAME}' already up to date in ${INTERFACES_FILE}."
+    else
+      backup_file "$INTERFACES_FILE"
+      if (( DRY_RUN )); then
+        echo "+ (would update) '${BRIDGE_NAME}' bridge block in ${INTERFACES_FILE}"
+      else
+        awk -v b="$BRIDGE_BEGIN" -v e="$BRIDGE_END" -v block="$bridge_block" '
+          $0==b {print block; skip=1; next}
+          skip && $0==e {skip=0; next}
+          skip {next}
+          {print}
+        ' "$INTERFACES_FILE" > "${INTERFACES_FILE}.tmp" && mv "${INTERFACES_FILE}.tmp" "$INTERFACES_FILE"
+      fi
+      echo "Updated '${BRIDGE_NAME}' bridge block in ${INTERFACES_FILE}."
+      bridge_changed=1
+    fi
+  else
+    backup_file "$INTERFACES_FILE"
+    if (( DRY_RUN )); then
+      echo "+ (would append) '${BRIDGE_NAME}' bridge block to ${INTERFACES_FILE}"
+    else
+      { echo; echo "$bridge_block"; } >> "$INTERFACES_FILE"
+    fi
+    echo "Added '${BRIDGE_NAME}' bridge block to ${INTERFACES_FILE}."
+    bridge_changed=1
+  fi
+
+  if (( bridge_changed )) && ! (( DRY_RUN )); then
+    if command -v ifreload >/dev/null 2>&1; then
+      run ifreload -a
+      echo "Applied networking changes with ifreload."
+    else
+      echo "NOTE: 'ifreload' not found; run 'systemctl restart networking' (or reboot) to bring up '${BRIDGE_NAME}'." >&2
+    fi
+  fi
+
+  echo "Linux bridge '${BRIDGE_NAME}' configured with ${BRIDGE_CIDR}."
+fi
+
+# ----------------------------
+# 4) Install & configure Samba share for the repository folder
 # ----------------------------
 if (( SKIP_SAMBA )); then
   echo
-  echo "== Step 3/4: Samba configuration skipped (--skip-samba) =="
+  echo "== Step 4/6: Samba configuration skipped (--skip-samba) =="
 else
   echo
-  echo "== Step 3/4: Configuring Samba share '${SHARE_NAME}' (${SHARE_PATH}) =="
+  echo "== Step 4/6: Configuring Samba share '${SHARE_NAME}' (${SHARE_PATH}) =="
 
   if ! command -v smbd >/dev/null 2>&1 || ! command -v smbpasswd >/dev/null 2>&1; then
     echo "Installing samba..."
@@ -320,14 +405,14 @@ EOF
 fi
 
 # ----------------------------
-# 4) Tune ZFS dataset backing the repository for throughput
+# 5) Tune ZFS dataset backing the repository for throughput
 # ----------------------------
 if (( SKIP_ZFS )); then
   echo
-  echo "== Step 4/4: ZFS tuning skipped (--skip-zfs) =="
+  echo "== Step 5/6: ZFS tuning skipped (--skip-zfs) =="
 else
   echo
-  echo "== Step 4/4: Tuning ZFS dataset '${ZFS_DATASET}' =="
+  echo "== Step 5/6: Tuning ZFS dataset '${ZFS_DATASET}' =="
 
   if ! command -v zfs >/dev/null 2>&1; then
     echo "WARNING: 'zfs' command not found; skipping ZFS tuning." >&2
