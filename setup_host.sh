@@ -36,6 +36,10 @@ BRIDGE_NAME="repo"
 BRIDGE_CIDR="10.200.0.1/24"
 
 DNSMASQ_CONF="/etc/dnsmasq.d/repo.conf"
+DHCP_RANGE_START="10.200.0.100"
+DHCP_RANGE_END="10.200.0.200"
+DHCP_LEASE_TIME="12h"
+DHCP_DNS_SERVERS="1.1.1.1,8.8.8.8"
 
 DRY_RUN=0
 DO_REBOOT=0
@@ -61,37 +65,45 @@ following the documented setup steps:
   - Samba is installed and a guest-accessible "${SHARE_NAME}" share is configured
     for ${SHARE_PATH} (in ${SMB_CONF}), served by the "${SMB_USER}" user
   - dnsmasq is installed and configured to serve DHCP (only) on the
-    "${BRIDGE_NAME}" bridge (in ${DNSMASQ_CONF}), then restarted
+    "${BRIDGE_NAME}" bridge (in ${DNSMASQ_CONF}), then restarted; the DHCP
+    gateway/netmask are derived from ${BRIDGE_CIDR}, and the pool defaults to
+    ${DHCP_RANGE_START}-${DHCP_RANGE_END}
   - The "${ZFS_DATASET}" ZFS dataset is tuned for throughput (recordsize,
     compression, atime, xattr, dnodesize)
 
 Options:
-  --reboot            Reboot the host automatically after applying changes.
-  --dry-run           Print what would change, without modifying anything.
-  --skip-samba        Do not install/configure Samba.
-  --skip-zfs          Do not apply the ZFS tuning properties.
-  --skip-bridge       Do not create/configure the "${BRIDGE_NAME}" Linux bridge.
-  --skip-dhcp         Do not install/configure the dnsmasq DHCP server.
-  --share-path PATH   Path to share via Samba (default: ${SHARE_PATH}).
-  --zfs-dataset NAME  ZFS dataset to tune (default: ${ZFS_DATASET}).
-  --bridge-name NAME  Name of the Linux bridge to create (default: ${BRIDGE_NAME}).
-  --bridge-cidr CIDR  Static IPv4/CIDR for the bridge (default: ${BRIDGE_CIDR}).
-  --help, -h          Show this help.
+  --reboot              Reboot the host automatically after applying changes.
+  --dry-run             Print what would change, without modifying anything.
+  --skip-samba          Do not install/configure Samba.
+  --skip-zfs            Do not apply the ZFS tuning properties.
+  --skip-bridge         Do not create/configure the "${BRIDGE_NAME}" Linux bridge.
+  --skip-dhcp           Do not install/configure the dnsmasq DHCP server.
+  --share-path PATH     Path to share via Samba (default: ${SHARE_PATH}).
+  --zfs-dataset NAME    ZFS dataset to tune (default: ${ZFS_DATASET}).
+  --bridge-name NAME    Name of the Linux bridge to create (default: ${BRIDGE_NAME}).
+  --bridge-cidr CIDR    Static IPv4/CIDR for the bridge (default: ${BRIDGE_CIDR}).
+                        Also used as the DHCP gateway/netmask; update
+                        --dhcp-range-start/--dhcp-range-end to match if changed.
+  --dhcp-range-start IP Start of the DHCP address pool (default: ${DHCP_RANGE_START}).
+  --dhcp-range-end IP   End of the DHCP address pool (default: ${DHCP_RANGE_END}).
+  --help, -h            Show this help.
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --reboot)       DO_REBOOT=1; shift ;;
-    --dry-run)      DRY_RUN=1; shift ;;
-    --skip-samba)   SKIP_SAMBA=1; shift ;;
-    --skip-zfs)     SKIP_ZFS=1; shift ;;
-    --skip-bridge)  SKIP_BRIDGE=1; shift ;;
-    --skip-dhcp)    SKIP_DHCP=1; shift ;;
-    --share-path)   SHARE_PATH="$2"; shift 2 ;;
-    --zfs-dataset)  ZFS_DATASET="$2"; shift 2 ;;
-    --bridge-name)  BRIDGE_NAME="$2"; shift 2 ;;
-    --bridge-cidr)  BRIDGE_CIDR="$2"; shift 2 ;;
+    --reboot)           DO_REBOOT=1; shift ;;
+    --dry-run)          DRY_RUN=1; shift ;;
+    --skip-samba)       SKIP_SAMBA=1; shift ;;
+    --skip-zfs)         SKIP_ZFS=1; shift ;;
+    --skip-bridge)      SKIP_BRIDGE=1; shift ;;
+    --skip-dhcp)        SKIP_DHCP=1; shift ;;
+    --share-path)       SHARE_PATH="$2"; shift 2 ;;
+    --zfs-dataset)      ZFS_DATASET="$2"; shift 2 ;;
+    --bridge-name)      BRIDGE_NAME="$2"; shift 2 ;;
+    --bridge-cidr)      BRIDGE_CIDR="$2"; shift 2 ;;
+    --dhcp-range-start) DHCP_RANGE_START="$2"; shift 2 ;;
+    --dhcp-range-end)   DHCP_RANGE_END="$2"; shift 2 ;;
     --help|-h)      usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -118,6 +130,23 @@ backup_file() {
     run cp -a "$file" "${file}.bak.${ts}"
     echo "Backed up ${file} -> ${file}.bak.${ts}"
   fi
+}
+
+# Converts a CIDR prefix length (e.g. 24) to a dotted-decimal netmask (e.g. 255.255.255.0).
+prefix_to_netmask() {
+  local prefix="$1" octets=() i
+  for ((i = 0; i < 4; i++)); do
+    if (( prefix >= 8 )); then
+      octets+=(255)
+      prefix=$((prefix - 8))
+    elif (( prefix > 0 )); then
+      octets+=($((256 - 2 ** (8 - prefix))))
+      prefix=0
+    else
+      octets+=(0)
+    fi
+  done
+  echo "${octets[0]}.${octets[1]}.${octets[2]}.${octets[3]}"
 }
 
 # ----------------------------
@@ -432,6 +461,14 @@ else
 
   run mkdir -p "$(dirname "$DNSMASQ_CONF")"
 
+  DHCP_GATEWAY="${BRIDGE_CIDR%%/*}"
+  bridge_prefix="${BRIDGE_CIDR##*/}"
+  if [[ ! "$bridge_prefix" =~ ^[0-9]+$ ]] || (( bridge_prefix < 0 || bridge_prefix > 32 )); then
+    echo "ERROR: invalid --bridge-cidr '${BRIDGE_CIDR}'; expected format like 10.200.0.1/24." >&2
+    exit 1
+  fi
+  DHCP_NETMASK="$(prefix_to_netmask "$bridge_prefix")"
+
   dnsmasq_conf_content="$(cat <<EOF
 # DHCP only; do not run DNS service on port 53
 port=0
@@ -441,13 +478,13 @@ interface=${BRIDGE_NAME}
 bind-dynamic
 
 # DHCP address pool
-dhcp-range=10.200.0.100,10.200.0.200,255.255.255.0,12h
+dhcp-range=${DHCP_RANGE_START},${DHCP_RANGE_END},${DHCP_NETMASK},${DHCP_LEASE_TIME}
 
 # Default gateway
-dhcp-option=option:router,10.200.0.1
+dhcp-option=option:router,${DHCP_GATEWAY}
 
 # DNS servers given to VMs
-dhcp-option=option:dns-server,1.1.1.1,8.8.8.8
+dhcp-option=option:dns-server,${DHCP_DNS_SERVERS}
 
 # This must be the only DHCP server on ${BRIDGE_NAME}
 dhcp-authoritative
@@ -472,8 +509,12 @@ EOF
 
   if command -v systemctl >/dev/null 2>&1; then
     run systemctl enable dnsmasq
-    run systemctl restart dnsmasq
-    echo "Restarted dnsmasq to apply DHCP configuration."
+    if (( dnsmasq_conf_changed )) || ! systemctl is-active --quiet dnsmasq 2>/dev/null; then
+      run systemctl restart dnsmasq
+      echo "Restarted dnsmasq to apply DHCP configuration."
+    else
+      echo "dnsmasq configuration unchanged; service left running."
+    fi
   else
     echo "NOTE: 'systemctl' not found; restart dnsmasq manually to apply DHCP configuration." >&2
   fi
