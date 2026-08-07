@@ -429,6 +429,11 @@ done
 #    while keeping RESERVED_CORES free, the per-VM core count is reduced (never the
 #    reserved amount) so the host still keeps its configured reserved cores.
 # ----------------------------
+if (( ${#NODE_GPUS[@]} == 0 )); then
+  echo "ERROR: no NUMA node with a detected GPU; cannot compute cores per VM." >&2
+  exit 1
+fi
+
 if (( CORES_PER_GPU > 0 )); then
   DESIRED_PHYS_PER_VM="$CORES_PER_GPU"
 else
@@ -447,7 +452,12 @@ for node in "${!NODE_GPUS[@]}"; do
 
   node_max_per_vm=$(( available / gcount ))
   node_per_vm="$DESIRED_PHYS_PER_VM"
-  (( node_max_per_vm < node_per_vm )) && node_per_vm="$node_max_per_vm"
+  if (( node_max_per_vm < node_per_vm )); then
+    if (( CORES_PER_GPU > 0 )); then
+      echo "WARNING: --cores-per-gpu=$CORES_PER_GPU requested, but NUMA node $node only has $phys_total physical cores for $gcount GPU(s) after reserving $RESERVED_CORES for the host. Reducing cores/VM on this node to $node_max_per_vm." >&2
+    fi
+    node_per_vm="$node_max_per_vm"
+  fi
 
   if (( node_per_vm < 1 )); then
     echo "ERROR: NUMA node $node has $phys_total physical cores; cannot reserve $RESERVED_CORES for the host and still assign at least 1 core per VM to $gcount GPU(s) there." >&2
