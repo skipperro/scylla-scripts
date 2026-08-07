@@ -562,6 +562,10 @@ if ! [[ "$TOTAL_RAM_MB" =~ ^[0-9]+$ ]] || (( TOTAL_RAM_MB <= 0 )); then
 fi
 
 DOG_VM_COUNT="${#GPU_BDFS[@]}"
+if (( DOG_VM_COUNT <= 0 )); then
+  echo "ERROR: no GPU VMs to distribute RAM to." >&2
+  exit 1
+fi
 
 HOST_RESERVED_RAM_MB=$(( TOTAL_RAM_MB * HOST_RESERVED_RAM_PERCENT / 100 ))
 AVAILABLE_RAM_MB=$(( TOTAL_RAM_MB - HOST_RESERVED_RAM_MB - KENNEL_MEMORY_MB ))
@@ -734,7 +738,7 @@ for i in "${!GPU_BDFS[@]}"; do
 
   apply_vm_config "$newid" "$aff" "$vcpus" "$vga" "$aud" "$PER_VM_MEMORY_MB"
 
-  echo "  -> VMID $newid done (cores/sockets + affinity + hostpci applied)"
+  echo "  -> VMID $newid done (cores/sockets + memory + affinity + hostpci applied)"
   echo
 done
 
