@@ -463,7 +463,7 @@ else
 
   DHCP_GATEWAY="${BRIDGE_CIDR%%/*}"
   bridge_prefix="${BRIDGE_CIDR##*/}"
-  if [[ ! "$bridge_prefix" =~ ^[0-9]+$ ]] || (( bridge_prefix < 0 || bridge_prefix > 32 )); then
+  if [[ ! "$bridge_prefix" =~ ^[0-9]+$ ]] || (( bridge_prefix < 1 || bridge_prefix > 32 )); then
     echo "ERROR: invalid --bridge-cidr '${BRIDGE_CIDR}'; expected format like 10.200.0.1/24." >&2
     exit 1
   fi
