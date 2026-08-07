@@ -10,6 +10,8 @@ set -euo pipefail
 # Defaults / CLI args
 # ----------------------------
 CORES_PER_GPU=0            # physical cores per VM (if set explicitly)
+MAX_CORES_PER_GPU=16       # cap on physical cores per VM when CORES_PER_GPU is not set explicitly
+RESERVED_CORES=16          # physical cores to keep unassigned (reserved for host) per NUMA node
 FORMAT="human"
 
 TEMPLATE_VMID=""
@@ -29,7 +31,15 @@ Usage:
 
 Core/GPU assignment options:
   --cores-per-gpu N      Physical cores per VM (SMT siblings included automatically).
-                         Default: 0 = AUTO uniform mode (same for ALL VMs).
+                         Default: 0 = AUTO uniform mode (same for ALL VMs), capped by
+                         --max-cores-per-gpu.
+  --max-cores-per-gpu N  Maximum physical cores per VM when --cores-per-gpu is not set
+                         explicitly (default: 16).
+  --reserved-cores N     Physical cores to keep unassigned per NUMA node, reserved for
+                         the host (default: 16). If the machine doesn't have enough
+                         cores to honor both the reserved cores and the (max) cores per
+                         GPU, cores assigned to each VM are reduced to keep the
+                         reserved host cores at the configured level.
   --format human|csv     Output format for the plan (default: human)
 
 Proxmox clone/apply options (only used if --template-vmid is given):
@@ -52,6 +62,8 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --cores-per-gpu|-c) CORES_PER_GPU="${2:-}"; shift 2 ;;
+    --max-cores-per-gpu) MAX_CORES_PER_GPU="${2:-}"; shift 2 ;;
+    --reserved-cores)   RESERVED_CORES="${2:-}"; shift 2 ;;
     --format|-f)        FORMAT="${2:-human}"; shift 2 ;;
     --template-vmid|-t) TEMPLATE_VMID="${2:-}"; shift 2 ;;
     --name-prefix)      NAME_PREFIX="${2:-}"; shift 2 ;;
@@ -68,6 +80,14 @@ done
 
 if ! [[ "$CORES_PER_GPU" =~ ^[0-9]+$ ]]; then
   echo "--cores-per-gpu must be a non-negative integer" >&2
+  exit 2
+fi
+if ! [[ "$MAX_CORES_PER_GPU" =~ ^[0-9]+$ ]] || (( MAX_CORES_PER_GPU < 1 )); then
+  echo "--max-cores-per-gpu must be a positive integer" >&2
+  exit 2
+fi
+if ! [[ "$RESERVED_CORES" =~ ^[0-9]+$ ]]; then
+  echo "--reserved-cores must be a non-negative integer" >&2
   exit 2
 fi
 if [[ -n "$TEMPLATE_VMID" ]] && ! [[ "$TEMPLATE_VMID" =~ ^[0-9]+$ ]]; then
@@ -400,34 +420,46 @@ done
 
 # ----------------------------
 # 3) Decide UNIFORM physical cores per VM
+#
+#    DESIRED_PHYS_PER_VM is the target cores/VM: the explicit --cores-per-gpu value
+#    if given, otherwise --max-cores-per-gpu (default 16).
+#
+#    On each NUMA node, RESERVED_CORES physical cores are kept unassigned for the
+#    host. If a node doesn't have enough cores to give every VM the desired amount
+#    while keeping RESERVED_CORES free, the per-VM core count is reduced (never the
+#    reserved amount) so the host still keeps its configured reserved cores.
 # ----------------------------
-UNIFORM_PHYS_PER_VM=0
-
 if (( CORES_PER_GPU > 0 )); then
-  UNIFORM_PHYS_PER_VM="$CORES_PER_GPU"
-  for node in "${!NODE_GPUS[@]}"; do
-    read -r -a gpu_idxs <<< "${NODE_GPUS[$node]}"
-    gcount="${#gpu_idxs[@]}"
-    phys_total="${NODE_PHYS_COUNT[$node]:-0}"
-    if (( phys_total < gcount * UNIFORM_PHYS_PER_VM )); then
-      echo "ERROR: NUMA node $node has $phys_total physical cores, but needs $((gcount*UNIFORM_PHYS_PER_VM)) for $gcount VMs (cores-per-gpu=$UNIFORM_PHYS_PER_VM)." >&2
-      exit 1
-    fi
-  done
+  DESIRED_PHYS_PER_VM="$CORES_PER_GPU"
 else
-  UNIFORM_PHYS_PER_VM=999999
-  for node in "${!NODE_GPUS[@]}"; do
-    read -r -a gpu_idxs <<< "${NODE_GPUS[$node]}"
-    gcount="${#gpu_idxs[@]}"
-    phys_total="${NODE_PHYS_COUNT[$node]:-0}"
-    (( gcount == 0 )) && continue
-    candidate=$(( phys_total / gcount ))
-    (( candidate < UNIFORM_PHYS_PER_VM )) && UNIFORM_PHYS_PER_VM="$candidate"
-  done
-  if (( UNIFORM_PHYS_PER_VM < 1 )); then
-    echo "ERROR: cannot allocate at least 1 physical core per VM uniformly." >&2
+  DESIRED_PHYS_PER_VM="$MAX_CORES_PER_GPU"
+fi
+
+UNIFORM_PHYS_PER_VM=999999
+for node in "${!NODE_GPUS[@]}"; do
+  read -r -a gpu_idxs <<< "${NODE_GPUS[$node]}"
+  gcount="${#gpu_idxs[@]}"
+  (( gcount == 0 )) && continue
+  phys_total="${NODE_PHYS_COUNT[$node]:-0}"
+
+  available=$(( phys_total - RESERVED_CORES ))
+  (( available < 0 )) && available=0
+
+  node_max_per_vm=$(( available / gcount ))
+  node_per_vm="$DESIRED_PHYS_PER_VM"
+  (( node_max_per_vm < node_per_vm )) && node_per_vm="$node_max_per_vm"
+
+  if (( node_per_vm < 1 )); then
+    echo "ERROR: NUMA node $node has $phys_total physical cores; cannot reserve $RESERVED_CORES for the host and still assign at least 1 core per VM to $gcount GPU(s) there." >&2
     exit 1
   fi
+
+  (( node_per_vm < UNIFORM_PHYS_PER_VM )) && UNIFORM_PHYS_PER_VM="$node_per_vm"
+done
+
+if (( UNIFORM_PHYS_PER_VM == 999999 )); then
+  echo "ERROR: cannot allocate at least 1 physical core per VM uniformly." >&2
+  exit 1
 fi
 
 # ----------------------------
@@ -501,7 +533,7 @@ else
     echo "NUMA node $node: physical cores in pool = ${NODE_PHYS_COUNT[$node]}"
   done
   echo
-  echo "Uniform physical cores per VM: $UNIFORM_PHYS_PER_VM"
+  echo "Uniform physical cores per VM: $UNIFORM_PHYS_PER_VM (max-cores-per-gpu=$MAX_CORES_PER_GPU, reserved-cores=$RESERVED_CORES)"
   echo
 
   for i in "${!GPU_BDFS[@]}"; do
