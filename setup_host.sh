@@ -6,8 +6,9 @@
 #   3. Load VFIO kernel modules (vfio, vfio_iommu_type1, vfio_pci, vfio_virqfd) via /etc/modules
 #   4. Create a Linux bridge ("repo", 10.200.0.1/24) on the host for the repository network
 #   5. Install & configure Samba to share a "repository" folder over the network
-#   6. Tune the backing ZFS dataset for throughput (recordsize, compression, atime, xattr, dnodesize)
-#   7. Optionally reboot to apply everything
+#   6. Install & configure dnsmasq to serve DHCP on the "repo" bridge, then restart it
+#   7. Tune the backing ZFS dataset for throughput (recordsize, compression, atime, xattr, dnodesize)
+#   8. Optionally reboot to apply everything
 #
 # Idempotent: safe to run multiple times, existing settings are preserved/updated in place.
 # A backup of each modified file is created before any change (*.bak.<timestamp>).
@@ -34,11 +35,18 @@ INTERFACES_FILE="/etc/network/interfaces"
 BRIDGE_NAME="repo"
 BRIDGE_CIDR="10.200.0.1/24"
 
+DNSMASQ_CONF="/etc/dnsmasq.d/repo.conf"
+DHCP_RANGE_START="10.200.0.100"
+DHCP_RANGE_END="10.200.0.200"
+DHCP_LEASE_TIME="12h"
+DHCP_DNS_SERVERS="1.1.1.1,8.8.8.8"
+
 DRY_RUN=0
 DO_REBOOT=0
 SKIP_SAMBA=0
 SKIP_ZFS=0
 SKIP_BRIDGE=0
+SKIP_DHCP=0
 
 usage() {
   cat <<EOF
@@ -56,34 +64,46 @@ following the documented setup steps:
     disabled (in ${INTERFACES_FILE})
   - Samba is installed and a guest-accessible "${SHARE_NAME}" share is configured
     for ${SHARE_PATH} (in ${SMB_CONF}), served by the "${SMB_USER}" user
+  - dnsmasq is installed and configured to serve DHCP (only) on the
+    "${BRIDGE_NAME}" bridge (in ${DNSMASQ_CONF}), then restarted; the DHCP
+    gateway/netmask are derived from ${BRIDGE_CIDR}, and the pool defaults to
+    ${DHCP_RANGE_START}-${DHCP_RANGE_END}
   - The "${ZFS_DATASET}" ZFS dataset is tuned for throughput (recordsize,
     compression, atime, xattr, dnodesize)
 
 Options:
-  --reboot            Reboot the host automatically after applying changes.
-  --dry-run           Print what would change, without modifying anything.
-  --skip-samba        Do not install/configure Samba.
-  --skip-zfs          Do not apply the ZFS tuning properties.
-  --skip-bridge       Do not create/configure the "${BRIDGE_NAME}" Linux bridge.
-  --share-path PATH   Path to share via Samba (default: ${SHARE_PATH}).
-  --zfs-dataset NAME  ZFS dataset to tune (default: ${ZFS_DATASET}).
-  --bridge-name NAME  Name of the Linux bridge to create (default: ${BRIDGE_NAME}).
-  --bridge-cidr CIDR  Static IPv4/CIDR for the bridge (default: ${BRIDGE_CIDR}).
-  --help, -h          Show this help.
+  --reboot              Reboot the host automatically after applying changes.
+  --dry-run             Print what would change, without modifying anything.
+  --skip-samba          Do not install/configure Samba.
+  --skip-zfs            Do not apply the ZFS tuning properties.
+  --skip-bridge         Do not create/configure the "${BRIDGE_NAME}" Linux bridge.
+  --skip-dhcp           Do not install/configure the dnsmasq DHCP server.
+  --share-path PATH     Path to share via Samba (default: ${SHARE_PATH}).
+  --zfs-dataset NAME    ZFS dataset to tune (default: ${ZFS_DATASET}).
+  --bridge-name NAME    Name of the Linux bridge to create (default: ${BRIDGE_NAME}).
+  --bridge-cidr CIDR    Static IPv4/CIDR for the bridge (default: ${BRIDGE_CIDR}).
+                        Also used as the DHCP gateway/netmask; update
+                        --dhcp-range-start/--dhcp-range-end to match if changed.
+  --dhcp-range-start IP Start of the DHCP address pool (default: ${DHCP_RANGE_START}).
+  --dhcp-range-end IP   End of the DHCP address pool (default: ${DHCP_RANGE_END}).
+  --help, -h            Show this help.
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --reboot)       DO_REBOOT=1; shift ;;
-    --dry-run)      DRY_RUN=1; shift ;;
-    --skip-samba)   SKIP_SAMBA=1; shift ;;
-    --skip-zfs)     SKIP_ZFS=1; shift ;;
-    --skip-bridge)  SKIP_BRIDGE=1; shift ;;
-    --share-path)   SHARE_PATH="$2"; shift 2 ;;
-    --zfs-dataset)  ZFS_DATASET="$2"; shift 2 ;;
-    --bridge-name)  BRIDGE_NAME="$2"; shift 2 ;;
-    --bridge-cidr)  BRIDGE_CIDR="$2"; shift 2 ;;
+    --reboot)           DO_REBOOT=1; shift ;;
+    --dry-run)          DRY_RUN=1; shift ;;
+    --skip-samba)       SKIP_SAMBA=1; shift ;;
+    --skip-zfs)         SKIP_ZFS=1; shift ;;
+    --skip-bridge)      SKIP_BRIDGE=1; shift ;;
+    --skip-dhcp)        SKIP_DHCP=1; shift ;;
+    --share-path)       SHARE_PATH="$2"; shift 2 ;;
+    --zfs-dataset)      ZFS_DATASET="$2"; shift 2 ;;
+    --bridge-name)      BRIDGE_NAME="$2"; shift 2 ;;
+    --bridge-cidr)      BRIDGE_CIDR="$2"; shift 2 ;;
+    --dhcp-range-start) DHCP_RANGE_START="$2"; shift 2 ;;
+    --dhcp-range-end)   DHCP_RANGE_END="$2"; shift 2 ;;
     --help|-h)      usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -112,12 +132,29 @@ backup_file() {
   fi
 }
 
+# Converts a CIDR prefix length (e.g. 24) to a dotted-decimal netmask (e.g. 255.255.255.0).
+prefix_to_netmask() {
+  local prefix="$1" octets=() i
+  for ((i = 0; i < 4; i++)); do
+    if (( prefix >= 8 )); then
+      octets+=(255)
+      prefix=$((prefix - 8))
+    elif (( prefix > 0 )); then
+      octets+=($((256 - 2 ** (8 - prefix))))
+      prefix=0
+    else
+      octets+=(0)
+    fi
+  done
+  echo "${octets[0]}.${octets[1]}.${octets[2]}.${octets[3]}"
+}
+
 # ----------------------------
 # 1) Edit GRUB: ensure GRUB_CMDLINE_LINUX_DEFAULT contains amd_iommu=on iommu=pt
 # ----------------------------
 [[ -f "$GRUB_FILE" ]] || { echo "ERROR: ${GRUB_FILE} not found. Is this a Debian/Proxmox host?" >&2; exit 1; }
 
-echo "== Step 1/6: Configuring GRUB (${GRUB_FILE}) =="
+echo "== Step 1/7: Configuring GRUB (${GRUB_FILE}) =="
 
 current_line="$(grep -m1 '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_FILE" || true)"
 current_value=""
@@ -166,7 +203,7 @@ run update-grub
 # 2) Load VFIO kernel modules via /etc/modules
 # ----------------------------
 echo
-echo "== Step 2/6: Configuring VFIO kernel modules (${MODULES_FILE}) =="
+echo "== Step 2/7: Configuring VFIO kernel modules (${MODULES_FILE}) =="
 
 [[ -f "$MODULES_FILE" ]] || run touch "$MODULES_FILE"
 
@@ -205,10 +242,10 @@ echo "GRUB and VFIO module configuration complete."
 # ----------------------------
 if (( SKIP_BRIDGE )); then
   echo
-  echo "== Step 3/6: Linux bridge configuration skipped (--skip-bridge) =="
+  echo "== Step 3/7: Linux bridge configuration skipped (--skip-bridge) =="
 else
   echo
-  echo "== Step 3/6: Configuring Linux bridge '${BRIDGE_NAME}' (${BRIDGE_CIDR}) =="
+  echo "== Step 3/7: Configuring Linux bridge '${BRIDGE_NAME}' (${BRIDGE_CIDR}) =="
 
   [[ -f "$INTERFACES_FILE" ]] || { echo "ERROR: ${INTERFACES_FILE} not found. Is this a Debian/Proxmox host?" >&2; exit 1; }
 
@@ -275,10 +312,10 @@ fi
 # ----------------------------
 if (( SKIP_SAMBA )); then
   echo
-  echo "== Step 4/6: Samba configuration skipped (--skip-samba) =="
+  echo "== Step 4/7: Samba configuration skipped (--skip-samba) =="
 else
   echo
-  echo "== Step 4/6: Configuring Samba share '${SHARE_NAME}' (${SHARE_PATH}) =="
+  echo "== Step 4/7: Configuring Samba share '${SHARE_NAME}' (${SHARE_PATH}) =="
 
   if ! command -v smbd >/dev/null 2>&1 || ! command -v smbpasswd >/dev/null 2>&1; then
     echo "Installing samba..."
@@ -405,14 +442,99 @@ EOF
 fi
 
 # ----------------------------
-# 5) Tune ZFS dataset backing the repository for throughput
+# 5) Install & configure dnsmasq to provide DHCP on the repository bridge
+# ----------------------------
+if (( SKIP_DHCP )); then
+  echo
+  echo "== Step 5/7: dnsmasq DHCP configuration skipped (--skip-dhcp) =="
+else
+  echo
+  echo "== Step 5/7: Configuring dnsmasq DHCP on '${BRIDGE_NAME}' (${DNSMASQ_CONF}) =="
+
+  if ! command -v dnsmasq >/dev/null 2>&1; then
+    echo "Installing dnsmasq..."
+    run env DEBIAN_FRONTEND=noninteractive apt-get update -y
+    run env DEBIAN_FRONTEND=noninteractive apt-get install -y dnsmasq
+  else
+    echo "dnsmasq already installed."
+  fi
+
+  run mkdir -p "$(dirname "$DNSMASQ_CONF")"
+
+  DHCP_GATEWAY="${BRIDGE_CIDR%%/*}"
+  bridge_prefix="${BRIDGE_CIDR##*/}"
+  if [[ ! "$bridge_prefix" =~ ^[0-9]+$ ]] || (( bridge_prefix < 1 || bridge_prefix > 32 )); then
+    echo "ERROR: invalid --bridge-cidr '${BRIDGE_CIDR}'; expected format like 10.200.0.1/24." >&2
+    exit 1
+  fi
+  DHCP_NETMASK="$(prefix_to_netmask "$bridge_prefix")"
+
+  dnsmasq_conf_content="$(cat <<EOF
+# DHCP only; do not run DNS service on port 53
+port=0
+
+# Serve only the Proxmox VM bridge
+interface=${BRIDGE_NAME}
+bind-dynamic
+
+# DHCP address pool
+dhcp-range=${DHCP_RANGE_START},${DHCP_RANGE_END},${DHCP_NETMASK},${DHCP_LEASE_TIME}
+
+# Default gateway
+dhcp-option=option:router,${DHCP_GATEWAY}
+
+# DNS servers given to VMs
+dhcp-option=option:dns-server,${DHCP_DNS_SERVERS}
+
+# This must be the only DHCP server on ${BRIDGE_NAME}
+dhcp-authoritative
+
+log-dhcp
+EOF
+)"
+
+  dnsmasq_conf_changed=1
+  if [[ -f "$DNSMASQ_CONF" ]] && [[ "$(cat "$DNSMASQ_CONF")" == "$dnsmasq_conf_content" ]]; then
+    echo "${DNSMASQ_CONF} already up to date."
+    dnsmasq_conf_changed=0
+  else
+    backup_file "$DNSMASQ_CONF"
+    if (( DRY_RUN )); then
+      echo "+ (would write) ${DNSMASQ_CONF}"
+    else
+      printf '%s\n' "$dnsmasq_conf_content" > "$DNSMASQ_CONF"
+    fi
+    echo "Wrote ${DNSMASQ_CONF}."
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    run systemctl enable dnsmasq
+    if (( dnsmasq_conf_changed )) || ! systemctl is-active --quiet dnsmasq 2>/dev/null; then
+      run systemctl restart dnsmasq
+      echo "Restarted dnsmasq to apply DHCP configuration."
+    else
+      echo "dnsmasq configuration unchanged; service left running."
+    fi
+  else
+    echo "NOTE: 'systemctl' not found; restart dnsmasq manually to apply DHCP configuration." >&2
+  fi
+
+  if (( dnsmasq_conf_changed )); then
+    echo "dnsmasq DHCP configured on '${BRIDGE_NAME}' (${DNSMASQ_CONF} updated)."
+  else
+    echo "dnsmasq DHCP configured on '${BRIDGE_NAME}' (${DNSMASQ_CONF} unchanged)."
+  fi
+fi
+
+# ----------------------------
+# 6) Tune ZFS dataset backing the repository for throughput
 # ----------------------------
 if (( SKIP_ZFS )); then
   echo
-  echo "== Step 5/6: ZFS tuning skipped (--skip-zfs) =="
+  echo "== Step 6/7: ZFS tuning skipped (--skip-zfs) =="
 else
   echo
-  echo "== Step 5/6: Tuning ZFS dataset '${ZFS_DATASET}' =="
+  echo "== Step 6/7: Tuning ZFS dataset '${ZFS_DATASET}' =="
 
   if ! command -v zfs >/dev/null 2>&1; then
     echo "WARNING: 'zfs' command not found; skipping ZFS tuning." >&2
