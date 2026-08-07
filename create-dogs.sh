@@ -12,6 +12,8 @@ set -euo pipefail
 CORES_PER_GPU=0            # physical cores per VM (if set explicitly)
 MAX_CORES_PER_GPU=16       # cap on physical cores per VM when CORES_PER_GPU is not set explicitly
 RESERVED_CORES=16          # physical cores to keep unassigned (reserved for host) per NUMA node
+HOST_RESERVED_RAM_PERCENT=20  # percent of total RAM to keep unassigned, reserved for the host
+KENNEL_MEMORY_MB=8192      # RAM (MB) given to the kennel VM, always fixed regardless of host RAM size
 FORMAT="human"
 
 TEMPLATE_VMID=""
@@ -40,6 +42,12 @@ Core/GPU assignment options:
                          cores to honor both the reserved cores and the (max) cores per
                          GPU, cores assigned to each VM are reduced to keep the
                          reserved host cores at the configured level.
+  --host-reserved-ram-percent N
+                         Percent of total system RAM to keep unassigned, reserved for
+                         the host (default: 20). The remaining RAM (minus the kennel
+                         VM's fixed allocation) is distributed evenly across the GPU
+                         (dog) VMs. The kennel VM always gets a fixed 8 GB regardless
+                         of this setting.
   --format human|csv     Output format for the plan (default: human)
 
 Proxmox clone/apply options (only used if --template-vmid is given):
@@ -64,6 +72,7 @@ while [[ $# -gt 0 ]]; do
     --cores-per-gpu|-c) CORES_PER_GPU="${2:-}"; shift 2 ;;
     --max-cores-per-gpu) MAX_CORES_PER_GPU="${2:-}"; shift 2 ;;
     --reserved-cores)   RESERVED_CORES="${2:-}"; shift 2 ;;
+    --host-reserved-ram-percent) HOST_RESERVED_RAM_PERCENT="${2:-}"; shift 2 ;;
     --format|-f)        FORMAT="${2:-human}"; shift 2 ;;
     --template-vmid|-t) TEMPLATE_VMID="${2:-}"; shift 2 ;;
     --name-prefix)      NAME_PREFIX="${2:-}"; shift 2 ;;
@@ -88,6 +97,10 @@ if ! [[ "$MAX_CORES_PER_GPU" =~ ^[0-9]+$ ]] || (( MAX_CORES_PER_GPU < 1 )); then
 fi
 if ! [[ "$RESERVED_CORES" =~ ^[0-9]+$ ]]; then
   echo "--reserved-cores must be a non-negative integer" >&2
+  exit 2
+fi
+if ! [[ "$HOST_RESERVED_RAM_PERCENT" =~ ^[0-9]+$ ]] || (( HOST_RESERVED_RAM_PERCENT > 100 )); then
+  echo "--host-reserved-ram-percent must be an integer between 0 and 100" >&2
   exit 2
 fi
 if [[ -n "$TEMPLATE_VMID" ]] && ! [[ "$TEMPLATE_VMID" =~ ^[0-9]+$ ]]; then
@@ -277,13 +290,14 @@ set_net0_bridge() {
   echo "net0: ${value}"
 }
 
-# Apply: affinity + hostpci + sockets/cores matching affinity + network bridge
+# Apply: affinity + hostpci + sockets/cores matching affinity + network bridge + memory
 apply_vm_config() {
   local vmid="$1"
   local affinity_ranges="$2"
   local vcpus="$3"
   local gpu_vga="$4"
   local gpu_audio="${5:-}"
+  local memory="${6:-}"
 
   local conf="/etc/pve/qemu-server/${vmid}.conf"
   [[ -f "$conf" ]] || { echo "ERROR: Missing config $conf" >&2; return 1; }
@@ -300,6 +314,7 @@ apply_vm_config() {
     !/^affinity:/ &&
     !/^cores:/ &&
     !/^sockets:/ &&
+    !/^memory:/ &&
     !/^onboot:/ &&
     !/^net0:/ { print }
   ' "$conf" > "$tmp"
@@ -315,6 +330,10 @@ apply_vm_config() {
   # Force sockets=1 so total vCPUs == cores
   echo "sockets: 1" >> "$tmp"
   echo "cores: ${vcpus}" >> "$tmp"
+
+  if [[ -n "$memory" ]]; then
+    echo "memory: ${memory}" >> "$tmp"
+  fi
 
   echo "affinity: ${affinity_ranges}" >> "$tmp"
 
@@ -528,13 +547,45 @@ if [[ -n "$dups" ]]; then
 fi
 
 # ----------------------------
-# 5) Print plan
+# 5) Decide RAM per VM
+#
+#    HOST_RESERVED_RAM_PERCENT of total system RAM is kept unassigned for the host.
+#    The kennel VM always gets a fixed KENNEL_MEMORY_MB (8 GB by default). Whatever
+#    RAM remains after those two reservations is split evenly across all GPU (dog) VMs.
+# ----------------------------
+command -v free >/dev/null 2>&1 || { echo "Missing 'free' (procps) - needed to detect total RAM" >&2; exit 1; }
+
+TOTAL_RAM_MB="$(free -m | awk '/^Mem:/ {print $2}')"
+if ! [[ "$TOTAL_RAM_MB" =~ ^[0-9]+$ ]] || (( TOTAL_RAM_MB <= 0 )); then
+  echo "ERROR: could not determine total system RAM." >&2
+  exit 1
+fi
+
+DOG_VM_COUNT="${#GPU_BDFS[@]}"
+
+HOST_RESERVED_RAM_MB=$(( TOTAL_RAM_MB * HOST_RESERVED_RAM_PERCENT / 100 ))
+AVAILABLE_RAM_MB=$(( TOTAL_RAM_MB - HOST_RESERVED_RAM_MB - KENNEL_MEMORY_MB ))
+
+if (( AVAILABLE_RAM_MB <= 0 )); then
+  echo "ERROR: no RAM left for GPU VMs after reserving ${HOST_RESERVED_RAM_PERCENT}% (${HOST_RESERVED_RAM_MB} MB) for the host and ${KENNEL_MEMORY_MB} MB for the kennel VM (total RAM: ${TOTAL_RAM_MB} MB)." >&2
+  exit 1
+fi
+
+PER_VM_MEMORY_MB=$(( AVAILABLE_RAM_MB / DOG_VM_COUNT ))
+
+if (( PER_VM_MEMORY_MB < 1 )); then
+  echo "ERROR: cannot allocate at least 1 MB of RAM per GPU VM ($DOG_VM_COUNT VMs, ${AVAILABLE_RAM_MB} MB available)." >&2
+  exit 1
+fi
+
+# ----------------------------
+# 6) Print plan
 # ----------------------------
 if [[ "$FORMAT" == "csv" ]]; then
-  echo "gpu_index,pci_bdf,numa_node,phys_per_vm,physical_cores(primary_cpu_id),logical_cpus,vcpus,affinity_ranges,audio_bdf,description"
+  echo "gpu_index,pci_bdf,numa_node,phys_per_vm,physical_cores(primary_cpu_id),logical_cpus,vcpus,memory_mb,affinity_ranges,audio_bdf,description"
   for i in "${!GPU_BDFS[@]}"; do
     desc="${GPU_DESC[$i]//\"/\"\"}"
-    echo "${i},${GPU_BDFS[$i]},${GPU_NODE[$i]},${UNIFORM_PHYS_PER_VM},\"${GPU_ASSIGNED_PHYS[$i]}\",\"${GPU_ASSIGNED_CPUS[$i]}\",${GPU_ASSIGNED_VCPUS[$i]},\"${GPU_ASSIGNED_AFFINITY[$i]}\",\"${GPU_AUDIO[$i]}\",\"${desc}\""
+    echo "${i},${GPU_BDFS[$i]},${GPU_NODE[$i]},${UNIFORM_PHYS_PER_VM},\"${GPU_ASSIGNED_PHYS[$i]}\",\"${GPU_ASSIGNED_CPUS[$i]}\",${GPU_ASSIGNED_VCPUS[$i]},${PER_VM_MEMORY_MB},\"${GPU_ASSIGNED_AFFINITY[$i]}\",\"${GPU_AUDIO[$i]}\",\"${desc}\""
   done
 else
   echo "Detected NVIDIA GPUs: ${#GPU_BDFS[@]}"
@@ -545,6 +596,11 @@ else
   echo
   echo "Uniform physical cores per VM: $UNIFORM_PHYS_PER_VM (max-cores-per-gpu=$MAX_CORES_PER_GPU, reserved-cores=$RESERVED_CORES)"
   echo
+  echo "Total system RAM: ${TOTAL_RAM_MB} MB"
+  echo "Host reserved RAM: ${HOST_RESERVED_RAM_MB} MB (${HOST_RESERVED_RAM_PERCENT}%)"
+  echo "Kennel VM RAM: ${KENNEL_MEMORY_MB} MB (fixed)"
+  echo "RAM per GPU VM: ${PER_VM_MEMORY_MB} MB (evenly split across ${DOG_VM_COUNT} VMs)"
+  echo
 
   for i in "${!GPU_BDFS[@]}"; do
     echo "GPU ${i}: ${GPU_DESC[$i]}"
@@ -553,6 +609,7 @@ else
     echo "  Physical cores (primary CPU id) : ${GPU_ASSIGNED_PHYS[$i]:-(none)}"
     echo "  Logical CPUs (SMT siblings)     : ${GPU_ASSIGNED_CPUS[$i]:-(none)}"
     echo "  vCPUs (for Proxmox cores=)      : ${GPU_ASSIGNED_VCPUS[$i]}"
+    echo "  Memory (for Proxmox memory=)    : ${PER_VM_MEMORY_MB} MB"
     echo "  Affinity (ranges)              : ${GPU_ASSIGNED_AFFINITY[$i]:-(none)}"
     echo "  GPU audio function (optional)  : ${GPU_AUDIO[$i]:-(none)}"
     echo
@@ -560,7 +617,7 @@ else
 fi
 
 # ----------------------------
-# 6) If template VMID given: clone VMs + apply affinity + GPU passthrough + vCPU count
+# 7) If template VMID given: clone VMs + apply affinity + GPU passthrough + vCPU count
 # ----------------------------
 if [[ -z "$TEMPLATE_VMID" ]]; then
   exit 0
@@ -584,10 +641,9 @@ echo "Environment: $ENVIRONMENT"
 echo
 
 # ----------------------------
-# 6a) Create kennel VM (shared drive manager, no GPU, minimal resources)
+# 7a) Create kennel VM (shared drive manager, no GPU, minimal resources)
 # ----------------------------
 KENNEL_CORES=8
-KENNEL_MEMORY=8192
 
 kennel_id="$(next_vmid)"
 kennel_name="${PVE_NODE_NAME}.kennel.${ENVIRONMENT}.arcware.com"
@@ -596,7 +652,7 @@ cmd=(qm clone "$TEMPLATE_VMID" "$kennel_id" --name "$kennel_name" --full 0)
 [[ -n "$TARGET_NODE" ]] && cmd+=(--target "$TARGET_NODE")
 [[ -n "$STORAGE_ID" ]] && cmd+=(--storage "$STORAGE_ID")
 
-echo "Creating kennel VM $kennel_id with name=$kennel_name (no GPU, ${KENNEL_CORES} cores, ${KENNEL_MEMORY}MB RAM)"
+echo "Creating kennel VM $kennel_id with name=$kennel_name (no GPU, ${KENNEL_CORES} cores, ${KENNEL_MEMORY_MB}MB RAM)"
 run "${cmd[@]}"
 
 run qm unlock "$kennel_id" || true
@@ -644,13 +700,13 @@ apply_kennel_config() {
   fi
 }
 
-apply_kennel_config "$kennel_id" "$KENNEL_CORES" "$KENNEL_MEMORY"
+apply_kennel_config "$kennel_id" "$KENNEL_CORES" "$KENNEL_MEMORY_MB"
 
 echo "  -> VMID $kennel_id done (kennel: minimal config, no GPU)"
 echo
 
 # ----------------------------
-# 6b) Create dog VMs with GPU passthrough
+# 7b) Create dog VMs with GPU passthrough
 # ----------------------------
 for i in "${!GPU_BDFS[@]}"; do
   aff="${GPU_ASSIGNED_AFFINITY[$i]}"
@@ -671,12 +727,12 @@ for i in "${!GPU_BDFS[@]}"; do
   [[ -n "$TARGET_NODE" ]] && cmd+=(--target "$TARGET_NODE")
   [[ -n "$STORAGE_ID" ]] && cmd+=(--storage "$STORAGE_ID")
 
-  echo "Creating VM $newid for GPU $i ($vga) with name=$vmname vCPUs=$vcpus affinity=$aff"
+  echo "Creating VM $newid for GPU $i ($vga) with name=$vmname vCPUs=$vcpus memory=${PER_VM_MEMORY_MB}MB affinity=$aff"
   run "${cmd[@]}"
 
   run qm unlock "$newid" || true
 
-  apply_vm_config "$newid" "$aff" "$vcpus" "$vga" "$aud"
+  apply_vm_config "$newid" "$aff" "$vcpus" "$vga" "$aud" "$PER_VM_MEMORY_MB"
 
   echo "  -> VMID $newid done (cores/sockets + affinity + hostpci applied)"
   echo
